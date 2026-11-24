@@ -14,6 +14,14 @@ resource "cursor_origin_repo_ruleset" "main" {
       required_approving_review_count   = 1
       dismiss_stale_reviews_on_push     = true
       required_review_thread_resolution = true
+      allowed_merge_methods             = ["squash", "merge"]
+
+      required_reviewer {
+        minimum_approvals = 1
+        group {
+          id = "grp_01k2ja2000e0080000000000g1"
+        }
+      }
     }
   }
 
@@ -36,7 +44,31 @@ resource "cursor_origin_repo_ruleset" "main" {
   bypass_actor {
     bypass_mode = "always"
     user {
-      id = "act_01k2ja2000e0080000000000u1"
+      id = "user_01k2ja2000e0080000000000c3"
+    }
+  }
+
+  bypass_actor {
+    bypass_mode = "pull_request_only"
+    group {
+      id = "grp_01k2ja2000e0080000000000g1"
+    }
+  }
+}
+
+resource "cursor_origin_repo_ruleset" "limit_push_size" {
+  owner       = "acme"
+  repo        = "rocket"
+  name        = "limit-push-size"
+  enforcement = "active"
+  kind        = "push_repository"
+
+  # A push_repository ruleset applies to every push and takes no ref patterns.
+  included_ref_names = []
+
+  rule {
+    max_file_size {
+      max_file_size_bytes = 10485760
     }
   }
 }

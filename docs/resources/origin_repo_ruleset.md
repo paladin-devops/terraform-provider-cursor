@@ -3,12 +3,12 @@
 page_title: "cursor_origin_repo_ruleset Resource - cursor"
 subcategory: ""
 description: |-
-  Manages an Origin repository ruleset. Update replaces rules and bypass actors. deletion_protection defaults to true, so Terraform will not delete or replace the ruleset until that is set to false and applied. A ruleset that would match no refs, contain no rules, or use enforcement disabled is rejected unless allow_unenforced is true.
+  Manages an Origin repository ruleset. Update replaces rules and bypass actors. deletion_protection defaults to true, so Terraform will not delete or replace the ruleset until that is set to false and applied. A ruleset that would match no refs, contain no rules, or use enforcement disabled is rejected unless allow_unenforced is true. A push_repository ruleset applies to every push: its ref lists must be empty, and an empty list still enforces.
 ---
 
 # cursor_origin_repo_ruleset (Resource)
 
-Manages an Origin repository ruleset. Update replaces rules and bypass actors. deletion_protection defaults to true, so Terraform will not delete or replace the ruleset until that is set to false and applied. A ruleset that would match no refs, contain no rules, or use enforcement disabled is rejected unless allow_unenforced is true.
+Manages an Origin repository ruleset. Update replaces rules and bypass actors. deletion_protection defaults to true, so Terraform will not delete or replace the ruleset until that is set to false and applied. A ruleset that would match no refs, contain no rules, or use enforcement disabled is rejected unless allow_unenforced is true. A push_repository ruleset applies to every push: its ref lists must be empty, and an empty list still enforces.
 
 ## Example Usage
 
@@ -29,6 +29,14 @@ resource "cursor_origin_repo_ruleset" "main" {
       required_approving_review_count   = 1
       dismiss_stale_reviews_on_push     = true
       required_review_thread_resolution = true
+      allowed_merge_methods             = ["squash", "merge"]
+
+      required_reviewer {
+        minimum_approvals = 1
+        group {
+          id = "grp_01k2ja2000e0080000000000g1"
+        }
+      }
     }
   }
 
@@ -51,7 +59,31 @@ resource "cursor_origin_repo_ruleset" "main" {
   bypass_actor {
     bypass_mode = "always"
     user {
-      id = "act_01k2ja2000e0080000000000u1"
+      id = "user_01k2ja2000e0080000000000c3"
+    }
+  }
+
+  bypass_actor {
+    bypass_mode = "pull_request_only"
+    group {
+      id = "grp_01k2ja2000e0080000000000g1"
+    }
+  }
+}
+
+resource "cursor_origin_repo_ruleset" "limit_push_size" {
+  owner       = "acme"
+  repo        = "rocket"
+  name        = "limit-push-size"
+  enforcement = "active"
+  kind        = "push_repository"
+
+  # A push_repository ruleset applies to every push and takes no ref patterns.
+  included_ref_names = []
+
+  rule {
+    max_file_size {
+      max_file_size_bytes = 10485760
     }
   }
 }
@@ -105,7 +137,7 @@ resource "cursor_origin_repo_ruleset" "release_tags" {
 ### Required
 
 - `enforcement` (String) Enforcement mode: active, evaluate, or disabled. disabled does not enforce the ruleset and requires allow_unenforced. evaluate records violations without blocking.
-- `included_ref_names` (List of String) Ref name patterns this ruleset includes. Supports globs and the tokens ~ALL and ~DEFAULT_BRANCH. Must contain at least one pattern, unless allow_unenforced is true and this is an explicit empty list. At most 64 entries. An empty list matches no refs.
+- `included_ref_names` (List of String) Ref name patterns this ruleset includes. Supports globs and the tokens ~ALL and ~DEFAULT_BRANCH. Must contain at least one pattern, unless allow_unenforced is true and this is an explicit empty list. At most 64 entries. An empty list matches no refs. A push_repository ruleset applies to every push, so this list must be empty and an empty list still enforces its rules.
 - `kind` (String) Ruleset kind: merge_branch, push_branch, push_tag, or push_repository. Changing kind while deletion_protection is true is rejected, because it retargets the operation this ruleset protects.
 - `name` (String) Ruleset name.
 - `owner` (String) Owner slug of the repository. Changing this replaces the ruleset, which deletes the existing one. Blocked while deletion_protection is true. Use "_" with the repository ID in repo to address the repository by its stable ID.
@@ -113,13 +145,13 @@ resource "cursor_origin_repo_ruleset" "release_tags" {
 
 ### Optional
 
-- `allow_broad_bypass` (Boolean) Must be true to bypass this ruleset for origin_role repository_write, which applies to every principal with write access. Specific user, team, app, and admin-role bypasses do not require this.
+- `allow_broad_bypass` (Boolean) Must be true to configure the deprecated origin_role repository_write bypass, which would apply to every principal with write access. The Origin API no longer accepts origin_role, and this provider rejects that block after this check. user, group, and app bypasses do not require this.
 - `allow_unenforced` (Boolean) Must be true to store a ruleset that does not enforce anything: enforcement disabled, no rules, no included ref names, or excluded_ref_names that remove every included ref (including ~ALL).
-- `bypass_actor` (Block List) Principals that may bypass this ruleset. At most 15 entries. Set exactly one of user, team, app, or origin_role. Update replaces the full list. (see [below for nested schema](#nestedblock--bypass_actor))
+- `bypass_actor` (Block List) Principals that may bypass this ruleset. At most 100 entries. Set exactly one of user, group, app, team, or origin_role. The Origin API stores user, group, or app. team and origin_role are deprecated; see those blocks. Update replaces the full list. (see [below for nested schema](#nestedblock--bypass_actor))
 - `deletion_protection` (Boolean) When true, Terraform will not delete this ruleset. That includes terraform destroy and replacements caused by changing owner or repo. Set to false and apply before destroying or moving the ruleset. Null is treated as protected.
 - `description` (String) Ruleset description. An empty string clears the description.
-- `excluded_ref_names` (List of String) Ref name patterns this ruleset excludes. Same pattern language and 64-entry cap as included_ref_names.
-- `rule` (Block List) Protection rules in this ruleset. Each rule block sets exactly one typed block: pull_request, require_status_checks, require_branch_up_to_date, deletion, non_fast_forward, block_direct_updates, or required_linear_history. Merge rules require kind merge_branch; push rules require a push_* kind. Must contain at least one rule, unless allow_unenforced is true. At most 20 entries. Update replaces the full list; a rule omitted from config is removed. (see [below for nested schema](#nestedblock--rule))
+- `excluded_ref_names` (List of String) Ref name patterns this ruleset excludes. Same pattern language and 64-entry cap as included_ref_names. Must be empty when kind is push_repository.
+- `rule` (Block List) Protection rules in this ruleset. Each rule block sets exactly one typed block: pull_request, require_status_checks, require_branch_up_to_date, deletion, non_fast_forward, block_direct_updates, block_merges, ref_name_pattern, required_linear_history, or max_file_size. Merge rules require kind merge_branch. Push rules require kind push_branch, push_tag, or push_repository, except max_file_size, which is valid only on push_repository. Must contain at least one rule, unless allow_unenforced is true. At most 50 entries. Update replaces the full list; a rule omitted from config is removed. (see [below for nested schema](#nestedblock--rule))
 
 ### Read-Only
 
@@ -135,8 +167,9 @@ Required:
 Optional:
 
 - `app` (Block, Optional) Bypass an Origin app principal. (see [below for nested schema](#nestedblock--bypass_actor--app))
-- `origin_role` (Block, Optional) Bypass holders of a policy-backed Origin role. (see [below for nested schema](#nestedblock--bypass_actor--origin_role))
-- `team` (Block, Optional) Bypass a team principal, identified by immutable public IDs rather than slugs. (see [below for nested schema](#nestedblock--bypass_actor--team))
+- `group` (Block, Optional) Bypass a Cursor organization group. Members of the group can bypass the ruleset. Identify the group by its immutable public ID; Origin derives the organization from that ID. (see [below for nested schema](#nestedblock--bypass_actor--group))
+- `origin_role` (Block, Optional, Deprecated) The Origin API no longer accepts an origin_role bypass actor and rejects the ruleset write. A role actor never granted a bypass, because Origin does not resolve who holds a role. Remove this block. To bypass the ruleset, add user, group, or app actors for the principals who should bypass it. (see [below for nested schema](#nestedblock--bypass_actor--origin_role))
+- `team` (Block, Optional, Deprecated) The Origin API no longer accepts a team bypass actor. Replace team { group_public_id = "grp_..." } with group { id = "grp_..." } and remove organization_public_id. Origin derives the organization from the group id. Until you migrate, this provider sends group_public_id as group.id and does not send organization_public_id. organization_public_id and group_public_id are still required while this block remains. (see [below for nested schema](#nestedblock--bypass_actor--team))
 - `user` (Block, Optional) Bypass a user principal. (see [below for nested schema](#nestedblock--bypass_actor--user))
 
 Read-Only:
@@ -151,12 +184,20 @@ Optional:
 - `id` (String) App ID (app_...). Required when the app block is set.
 
 
+<a id="nestedblock--bypass_actor--group"></a>
+### Nested Schema for `bypass_actor.group`
+
+Optional:
+
+- `id` (String) Group public ID (grp_...). Required when the group block is set.
+
+
 <a id="nestedblock--bypass_actor--origin_role"></a>
 ### Nested Schema for `bypass_actor.origin_role`
 
 Optional:
 
-- `role` (String) Required when the origin_role block is set. Role: namespace_admin, repository_admin, or repository_write. repository_write applies to every principal with write access and requires allow_broad_bypass.
+- `role` (String) Required when the origin_role block is set. Role: namespace_admin, repository_admin, or repository_write. repository_write applies to every principal with write access and requires allow_broad_bypass. The block is rejected because the API no longer accepts it.
 
 
 <a id="nestedblock--bypass_actor--team"></a>
@@ -164,8 +205,8 @@ Optional:
 
 Optional:
 
-- `group_public_id` (String) Group public ID. Required when the team block is set.
-- `organization_public_id` (String) Organization public ID. Required when the team block is set.
+- `group_public_id` (String) Group public ID (grp_...). Required when the team block is set. Sent as group.id.
+- `organization_public_id` (String) Organization public ID. Required when the team block is set. Not sent: Origin derives the organization from the group id.
 
 
 <a id="nestedblock--bypass_actor--user"></a>
@@ -173,7 +214,7 @@ Optional:
 
 Optional:
 
-- `id` (String) User actor ID (act_...). Required when the user block is set.
+- `id` (String) User public ID (user_...). Required when the user block is set.
 
 
 
@@ -185,8 +226,9 @@ Optional:
 - `block_direct_updates` (Block, Optional) Push rule: require updates to matching refs to go through a pull request. Takes no arguments; write `block_direct_updates {}`, which stores the rule with Origin's default of blocking direct updates. Rulesets of kind push_branch, push_tag, or push_repository only. (see [below for nested schema](#nestedblock--rule--block_direct_updates))
 - `block_merges` (Block, Optional) Push rule: block pull request merges into matching refs. Takes no arguments; write `block_merges {}`. Rulesets of kind push_branch, push_tag, or push_repository only. (see [below for nested schema](#nestedblock--rule--block_merges))
 - `deletion` (Block, Optional) Push rule: block deleting matching refs. Takes no arguments; write `deletion {}`. Rulesets of kind push_branch, push_tag, or push_repository only. (see [below for nested schema](#nestedblock--rule--deletion))
+- `max_file_size` (Block, Optional) Push rule: reject a push that introduces a file larger than max_file_size_bytes. The whole push is rejected, including other refs it changes. Files the repository already stores are not judged again. Only rulesets of kind push_repository accept this rule. (see [below for nested schema](#nestedblock--rule--max_file_size))
 - `non_fast_forward` (Block, Optional) Push rule: block force pushes to matching refs. Takes no arguments; write `non_fast_forward {}`. Rulesets of kind push_branch, push_tag, or push_repository only. (see [below for nested schema](#nestedblock--rule--non_fast_forward))
-- `pull_request` (Block, Optional) Merge rule: require a pull request before merging. Every argument is optional; omitted arguments use the Origin default. Rulesets of kind merge_branch only. (see [below for nested schema](#nestedblock--rule--pull_request))
+- `pull_request` (Block, Optional) Merge rule: require a pull request before merging. Every argument is optional; omitted arguments use the Origin default. allowed_merge_methods and required_reviewer are sent on update when set, so an update does not clear them. Rulesets of kind merge_branch only. (see [below for nested schema](#nestedblock--rule--pull_request))
 - `ref_name_pattern` (Block, Optional) Push rule: restrict ref names that can be created or updated. Rulesets of kind push_branch, push_tag, or push_repository only. (see [below for nested schema](#nestedblock--rule--ref_name_pattern))
 - `require_branch_up_to_date` (Block, Optional) Merge rule: require the pull request head to be up to date with the base branch before merging. Takes no arguments; write `require_branch_up_to_date {}`. Rulesets of kind merge_branch only. (see [below for nested schema](#nestedblock--rule--require_branch_up_to_date))
 - `require_status_checks` (Block, Optional) Merge rule: require the listed checks to pass on the head commit before merging. Rulesets of kind merge_branch only. (see [below for nested schema](#nestedblock--rule--require_status_checks))
@@ -208,6 +250,14 @@ Read-Only:
 ### Nested Schema for `rule.deletion`
 
 
+<a id="nestedblock--rule--max_file_size"></a>
+### Nested Schema for `rule.max_file_size`
+
+Optional:
+
+- `max_file_size_bytes` (Number) Largest file a push can introduce, in bytes, from 1 to 104857600 (100 MiB). Required when the max_file_size block is set.
+
+
 <a id="nestedblock--rule--non_fast_forward"></a>
 ### Nested Schema for `rule.non_fast_forward`
 
@@ -217,11 +267,30 @@ Read-Only:
 
 Optional:
 
+- `allowed_merge_methods` (List of String) Merge methods a pull request can land with on a targeted branch: merge, squash, or both. Omit it to allow every method the repository allows. An empty list is rejected. A method the repository disables stays disabled, and when several active rulesets apply, only a method every one of them lists is allowed.
 - `dismiss_stale_reviews_on_push` (Boolean) Dismiss existing approvals when new commits are pushed to the pull request.
 - `require_code_owner_review` (Boolean) Require an approving review from a code owner of every changed file.
 - `require_last_push_approval` (Boolean) Require the most recent push to be approved by someone other than the person who pushed it.
-- `required_approving_review_count` (Number) Number of approving reviews required before the pull request can merge, from 0 to 50.
+- `required_approving_review_count` (Number) Number of approving reviews required before the pull request can merge, from 0 to 50. An approval counts only while the user can submit reviews on the repository.
 - `required_review_thread_resolution` (Boolean) Require every review thread to be resolved before merging.
+- `required_reviewer` (Block List) Cursor organization group whose members must approve, in addition to required_approving_review_count. At most 20 groups, each listed once. A group that later stops resolving blocks every merge this rule covers. An approval counts only while the member can submit reviews on the repository. (see [below for nested schema](#nestedblock--rule--pull_request--required_reviewer))
+
+<a id="nestedblock--rule--pull_request--required_reviewer"></a>
+### Nested Schema for `rule.pull_request.required_reviewer`
+
+Optional:
+
+- `group` (Block, Optional) The group that must approve, named by its immutable public ID. Required in each required_reviewer. (see [below for nested schema](#nestedblock--rule--pull_request--required_reviewer--group))
+- `minimum_approvals` (Number) Approvals required from distinct members of the group, from 1 to 50. Omit it to use the Origin default of 1.
+
+<a id="nestedblock--rule--pull_request--required_reviewer--group"></a>
+### Nested Schema for `rule.pull_request.required_reviewer.group`
+
+Optional:
+
+- `id` (String) Group public ID (grp_...). Origin derives the group's organization from it. Required when the group block is set.
+
+
 
 
 <a id="nestedblock--rule--ref_name_pattern"></a>
