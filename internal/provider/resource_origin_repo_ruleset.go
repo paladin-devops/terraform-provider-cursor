@@ -51,12 +51,17 @@ type originRepoRulesetBypassModel struct {
 	ID         types.String                      `tfsdk:"id"`
 	BypassMode types.String                      `tfsdk:"bypass_mode"`
 	User       *originRepoRulesetUserModel       `tfsdk:"user"`
+	Group      *originRepoRulesetGroupModel      `tfsdk:"group"`
 	Team       *originRepoRulesetTeamModel       `tfsdk:"team"`
 	App        *originRepoRulesetAppModel        `tfsdk:"app"`
 	OriginRole *originRepoRulesetOriginRoleModel `tfsdk:"origin_role"`
 }
 
 type originRepoRulesetUserModel struct {
+	ID types.String `tfsdk:"id"`
+}
+
+type originRepoRulesetGroupModel struct {
 	ID types.String `tfsdk:"id"`
 }
 
@@ -83,7 +88,7 @@ func (r *originRepoRulesetResource) Metadata(_ context.Context, req resource.Met
 
 func (r *originRepoRulesetResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Manages an Origin repository ruleset. Update replaces rules and bypass actors. deletion_protection defaults to true, so Terraform will not delete or replace the ruleset until that is set to false and applied. A ruleset that would match no refs, contain no rules, or use enforcement disabled is rejected unless allow_unenforced is true.",
+		Description: "Manages an Origin repository ruleset. Update replaces rules and bypass actors. deletion_protection defaults to true, so Terraform will not delete or replace the ruleset until that is set to false and applied. A ruleset that would match no refs, contain no rules, or use enforcement disabled is rejected unless allow_unenforced is true. A push_repository ruleset applies to every push: its ref lists must be empty, and an empty list still enforces.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:    true,
@@ -127,14 +132,14 @@ func (r *originRepoRulesetResource) Schema(_ context.Context, _ resource.SchemaR
 			"included_ref_names": schema.ListAttribute{
 				Required:    true,
 				ElementType: types.StringType,
-				Description: "Ref name patterns this ruleset includes. Supports globs and the tokens ~ALL and ~DEFAULT_BRANCH. Must contain at least one pattern, unless allow_unenforced is true and this is an explicit empty list. At most 64 entries. An empty list matches no refs.",
+				Description: "Ref name patterns this ruleset includes. Supports globs and the tokens ~ALL and ~DEFAULT_BRANCH. Must contain at least one pattern, unless allow_unenforced is true and this is an explicit empty list. At most 64 entries. An empty list matches no refs. A push_repository ruleset applies to every push, so this list must be empty and an empty list still enforces its rules.",
 			},
 			"excluded_ref_names": schema.ListAttribute{
 				Optional:    true,
 				Computed:    true,
 				ElementType: types.StringType,
 				Default:     listdefault.StaticValue(emptyStringList()),
-				Description: "Ref name patterns this ruleset excludes. Same pattern language and 64-entry cap as included_ref_names.",
+				Description: "Ref name patterns this ruleset excludes. Same pattern language and 64-entry cap as included_ref_names. Must be empty when kind is push_repository.",
 			},
 			"deletion_protection": schema.BoolAttribute{
 				Optional:    true,
@@ -152,12 +157,12 @@ func (r *originRepoRulesetResource) Schema(_ context.Context, _ resource.SchemaR
 				Optional:    true,
 				Computed:    true,
 				Default:     booldefault.StaticBool(false),
-				Description: "Must be true to bypass this ruleset for origin_role repository_write, which applies to every principal with write access. Specific user, team, app, and admin-role bypasses do not require this.",
+				Description: "Must be true to configure the deprecated origin_role repository_write bypass, which would apply to every principal with write access. The Origin API no longer accepts origin_role, and this provider rejects that block after this check. user, group, and app bypasses do not require this.",
 			},
 		},
 		Blocks: map[string]schema.Block{
 			"rule": schema.ListNestedBlock{
-				Description: "Protection rules in this ruleset. Each rule block sets exactly one typed block: pull_request, require_status_checks, require_branch_up_to_date, deletion, non_fast_forward, block_direct_updates, or required_linear_history. Merge rules require kind merge_branch; push rules require a push_* kind. Must contain at least one rule, unless allow_unenforced is true. At most 20 entries. Update replaces the full list; a rule omitted from config is removed.",
+				Description: fmt.Sprintf("Protection rules in this ruleset. Each rule block sets exactly one typed block: pull_request, require_status_checks, require_branch_up_to_date, deletion, non_fast_forward, block_direct_updates, block_merges, ref_name_pattern, required_linear_history, or max_file_size. Merge rules require kind merge_branch. Push rules require kind push_branch, push_tag, or push_repository, except max_file_size, which is valid only on push_repository. Must contain at least one rule, unless allow_unenforced is true. At most %d entries. Update replaces the full list; a rule omitted from config is removed.", maxOriginRules),
 				NestedObject: schema.NestedBlockObject{
 					Attributes: map[string]schema.Attribute{
 						"id": schema.StringAttribute{
@@ -169,7 +174,7 @@ func (r *originRepoRulesetResource) Schema(_ context.Context, _ resource.SchemaR
 				},
 			},
 			"bypass_actor": schema.ListNestedBlock{
-				Description: "Principals that may bypass this ruleset. At most 15 entries. Set exactly one of user, team, app, or origin_role. Update replaces the full list.",
+				Description: fmt.Sprintf("Principals that may bypass this ruleset. At most %d entries. Set exactly one of %s. The Origin API stores user, group, or app. team and origin_role are deprecated; see those blocks. Update replaces the full list.", maxOriginBypassActors, originBypassPrincipalChoices),
 				NestedObject: schema.NestedBlockObject{
 					Attributes: map[string]schema.Attribute{
 						"id": schema.StringAttribute{
@@ -187,20 +192,30 @@ func (r *originRepoRulesetResource) Schema(_ context.Context, _ resource.SchemaR
 							Attributes: map[string]schema.Attribute{
 								"id": schema.StringAttribute{
 									Optional:    true,
-									Description: "User actor ID (act_...). Required when the user block is set.",
+									Description: "User public ID (user_...). Required when the user block is set.",
+								},
+							},
+						},
+						"group": schema.SingleNestedBlock{
+							Description: "Bypass a Cursor organization group. Members of the group can bypass the ruleset. Identify the group by its immutable public ID; Origin derives the organization from that ID.",
+							Attributes: map[string]schema.Attribute{
+								"id": schema.StringAttribute{
+									Optional:    true,
+									Description: "Group public ID (grp_...). Required when the group block is set.",
 								},
 							},
 						},
 						"team": schema.SingleNestedBlock{
-							Description: "Bypass a team principal, identified by immutable public IDs rather than slugs.",
+							Description:        originBypassTeamDeprecation + " organization_public_id and group_public_id are still required while this block remains.",
+							DeprecationMessage: originBypassTeamDeprecation,
 							Attributes: map[string]schema.Attribute{
 								"organization_public_id": schema.StringAttribute{
 									Optional:    true,
-									Description: "Organization public ID. Required when the team block is set.",
+									Description: "Organization public ID. Required when the team block is set. Not sent: Origin derives the organization from the group id.",
 								},
 								"group_public_id": schema.StringAttribute{
 									Optional:    true,
-									Description: "Group public ID. Required when the team block is set.",
+									Description: "Group public ID (grp_...). Required when the team block is set. Sent as group.id.",
 								},
 							},
 						},
@@ -214,11 +229,12 @@ func (r *originRepoRulesetResource) Schema(_ context.Context, _ resource.SchemaR
 							},
 						},
 						"origin_role": schema.SingleNestedBlock{
-							Description: "Bypass holders of a policy-backed Origin role.",
+							Description:        originBypassOriginRoleDeprecation,
+							DeprecationMessage: originBypassOriginRoleDeprecation,
 							Attributes: map[string]schema.Attribute{
 								"role": schema.StringAttribute{
 									Optional:    true,
-									Description: "Required when the origin_role block is set. Role: namespace_admin, repository_admin, or repository_write. repository_write applies to every principal with write access and requires allow_broad_bypass.",
+									Description: "Required when the origin_role block is set. Role: namespace_admin, repository_admin, or repository_write. repository_write applies to every principal with write access and requires allow_broad_bypass. The block is rejected because the API no longer accepts it.",
 								},
 							},
 						},
@@ -464,6 +480,9 @@ func validateOriginRulesetModel(ctx context.Context, model originRepoRulesetMode
 	if err := validateRefs(excluded, excludedKnown, "excluded_ref_names"); err != nil {
 		return err
 	}
+	if err := validatePushRepositoryRefs(model.Kind, included, includedKnown, excluded, excludedKnown); err != nil {
+		return err
+	}
 	if !boolEnabled(model.AllowUnenforced) {
 		if reason, unenforced := rulesetUnenforced(model, includedKnown, included, excludedKnown, excluded); unenforced {
 			return fmt.Errorf("%s; set allow_unenforced = true to store a ruleset that does not enforce anything", reason)
@@ -473,6 +492,9 @@ func validateOriginRulesetModel(ctx context.Context, model originRepoRulesetMode
 		if err := rejectBroadBypass(model.BypassActors); err != nil {
 			return err
 		}
+	}
+	if err := rejectRetiredOriginRole(model.BypassActors); err != nil {
+		return err
 	}
 	return nil
 }
@@ -489,12 +511,30 @@ func validateRefs(values []string, known bool, name string) error {
 	return nil
 }
 
+func validatePushRepositoryRefs(kind types.String, included []string, includedKnown bool, excluded []string, excludedKnown bool) error {
+	if kind.IsNull() || kind.IsUnknown() || kind.ValueString() != originRulesetKindPushRepository {
+		return nil
+	}
+	if includedKnown && len(included) > 0 {
+		return fmt.Errorf("included_ref_names must be empty when kind is push_repository; that ruleset applies to every push and the Origin API rejects ref patterns")
+	}
+	if excludedKnown && len(excluded) > 0 {
+		return fmt.Errorf("excluded_ref_names must be empty when kind is push_repository; that ruleset applies to every push and the Origin API rejects ref patterns")
+	}
+	return nil
+}
+
 func rulesetUnenforced(model originRepoRulesetModel, includedKnown bool, included []string, excludedKnown bool, excluded []string) (string, bool) {
 	if !model.Enforcement.IsNull() && !model.Enforcement.IsUnknown() && model.Enforcement.ValueString() == originRulesetEnforcementDisabled {
 		return "enforcement is disabled", true
 	}
 	if len(model.Rules) == 0 {
 		return "rule is empty", true
+	}
+	// A push_repository ruleset covers every push. Empty ref lists are how it
+	// is stored, not a sign that it matches nothing.
+	if !model.Kind.IsNull() && !model.Kind.IsUnknown() && model.Kind.ValueString() == originRulesetKindPushRepository {
+		return "", false
 	}
 	if excludedKnown && containsRefToken(excluded, "~ALL") {
 		return "excluded_ref_names contains ~ALL, which excludes every ref", true
@@ -534,6 +574,16 @@ func containsRefToken(values []string, token string) bool {
 		}
 	}
 	return false
+}
+
+func rejectRetiredOriginRole(actors []originRepoRulesetBypassModel) error {
+	for i, actor := range actors {
+		if actor.OriginRole == nil || actor.OriginRole.Role.IsUnknown() {
+			continue
+		}
+		return fmt.Errorf("bypass_actor[%d].origin_role: %s", i, originBypassOriginRoleDeprecation)
+	}
+	return nil
 }
 
 func rejectBroadBypass(actors []originRepoRulesetBypassModel) error {
@@ -601,6 +651,12 @@ func validateOriginBypassActor(index int, actor originRepoRulesetBypassModel) er
 			}
 		}
 	}
+	if actor.Group != nil {
+		set++
+		if err := requireGroupPublicID(actor.Group.ID, name+".group.id"); err != nil {
+			return err
+		}
+	}
 	if actor.Team != nil {
 		set++
 		if !actor.Team.OrganizationPublicID.IsUnknown() {
@@ -611,13 +667,8 @@ func validateOriginBypassActor(index int, actor originRepoRulesetBypassModel) er
 				return err
 			}
 		}
-		if !actor.Team.GroupPublicID.IsUnknown() {
-			if err := requireNonEmptyUnpadded(actor.Team.GroupPublicID, name+".team.group_public_id"); err != nil {
-				return err
-			}
-			if err := rejectBroadPrincipalID(actor.Team.GroupPublicID.ValueString(), name+".team.group_public_id"); err != nil {
-				return err
-			}
+		if err := requireGroupPublicID(actor.Team.GroupPublicID, name+".team.group_public_id"); err != nil {
+			return err
 		}
 	}
 	if actor.App != nil {
@@ -638,7 +689,23 @@ func validateOriginBypassActor(index int, actor originRepoRulesetBypassModel) er
 		}
 	}
 	if set != 1 && !(set == 0 && actor.BypassMode.IsUnknown()) {
-		return fmt.Errorf("%s must set exactly one of user, team, app, or origin_role", name)
+		return fmt.Errorf("%s must set exactly one of %s", name, originBypassPrincipalChoices)
+	}
+	return nil
+}
+
+func requireGroupPublicID(value types.String, name string) error {
+	if err := requireNonEmptyUnpadded(value, name); err != nil {
+		return err
+	}
+	if value.IsUnknown() {
+		return nil
+	}
+	if err := rejectBroadPrincipalID(value.ValueString(), name); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(value.ValueString(), originGroupIDPrefix) {
+		return fmt.Errorf("%s must be a group public ID (%s...), got %q", name, originGroupIDPrefix, value.ValueString())
 	}
 	return nil
 }
@@ -715,8 +782,12 @@ func rulesetWriteFromModel(ctx context.Context, model originRepoRulesetModel) (o
 		})
 	}
 	actors := make([]originRulesetBypassActorInput, 0, len(model.BypassActors))
-	for _, actor := range model.BypassActors {
-		actors = append(actors, bypassActorInputFromModel(actor))
+	for i, actor := range model.BypassActors {
+		input, err := bypassActorInputFromModel(actor)
+		if err != nil {
+			return originRulesetWrite{}, fmt.Errorf("bypass_actor[%d]: %w", i, err)
+		}
+		actors = append(actors, input)
 	}
 	description := ""
 	if !model.Description.IsNull() && !model.Description.IsUnknown() {
@@ -734,26 +805,35 @@ func rulesetWriteFromModel(ctx context.Context, model originRepoRulesetModel) (o
 	}, nil
 }
 
-func bypassActorInputFromModel(actor originRepoRulesetBypassModel) originRulesetBypassActorInput {
+func bypassActorInputFromModel(actor originRepoRulesetBypassModel) (originRulesetBypassActorInput, error) {
 	input := originRulesetBypassActorInput{
 		BypassMode: actor.BypassMode.ValueString(),
 	}
+	set := 0
 	if actor.User != nil {
+		set++
 		input.User = &originRulesetUserBypass{ID: actor.User.ID.ValueString()}
 	}
+	if actor.Group != nil {
+		set++
+		input.Group = &originRulesetGroupBypass{ID: actor.Group.ID.ValueString()}
+	}
 	if actor.Team != nil {
-		input.Team = &originRulesetTeamBypass{
-			OrganizationPublicID: actor.Team.OrganizationPublicID.ValueString(),
-			GroupPublicID:        actor.Team.GroupPublicID.ValueString(),
-		}
+		set++
+		// The API rejects team. group_public_id is the group public ID it stores as group.id.
+		input.Group = &originRulesetGroupBypass{ID: actor.Team.GroupPublicID.ValueString()}
 	}
 	if actor.App != nil {
+		set++
 		input.App = &originRulesetAppBypass{ID: actor.App.ID.ValueString()}
 	}
 	if actor.OriginRole != nil {
-		input.OriginRole = &originRulesetOriginRoleBypass{Role: actor.OriginRole.Role.ValueString()}
+		return originRulesetBypassActorInput{}, fmt.Errorf("%s", originBypassOriginRoleDeprecation)
 	}
-	return input
+	if set != 1 {
+		return originRulesetBypassActorInput{}, fmt.Errorf("must set exactly one of %s", originBypassPrincipalChoices)
+	}
+	return input, nil
 }
 
 func originRulesetToModel(ctx context.Context, prior originRepoRulesetModel, ruleset *originRuleset, apply bool) (originRepoRulesetModel, error) {
@@ -779,6 +859,12 @@ func originRulesetToModel(ctx context.Context, prior originRepoRulesetModel, rul
 	excluded, err := stringListValue(ctx, ruleset.ExcludedRefNames)
 	if err != nil {
 		return originRepoRulesetModel{}, err
+	}
+
+	for i := range rules {
+		if rules[i].PullRequest != nil {
+			rules[i].PullRequest.AllowedMergeMethods = ensureStringList(rules[i].PullRequest.AllowedMergeMethods)
+		}
 	}
 
 	return originRepoRulesetModel{
@@ -870,7 +956,7 @@ func alignBypassActors(prior []originRepoRulesetBypassModel, api []originRuleset
 	for i, want := range prior {
 		key, ok := bypassKeyFromModel(want)
 		if !ok {
-			return nil, fmt.Errorf("bypass_actor[%d] must set exactly one of user, team, app, or origin_role", i)
+			return nil, fmt.Errorf("bypass_actor[%d] must set exactly one of %s", i, originBypassPrincipalChoices)
 		}
 		match := -1
 		for j, actor := range api {
@@ -935,9 +1021,15 @@ func bypassKeyFromModel(actor originRepoRulesetBypassModel) (bypassKey, bool) {
 		set++
 		key = bypassKey{kind: "user", a: actor.User.ID.ValueString()}
 	}
-	if actor.Team != nil && !actor.Team.OrganizationPublicID.IsNull() && !actor.Team.OrganizationPublicID.IsUnknown() && !actor.Team.GroupPublicID.IsNull() && !actor.Team.GroupPublicID.IsUnknown() {
+	if actor.Group != nil && !actor.Group.ID.IsNull() && !actor.Group.ID.IsUnknown() {
 		set++
-		key = bypassKey{kind: "team", a: actor.Team.OrganizationPublicID.ValueString(), b: actor.Team.GroupPublicID.ValueString()}
+		key = bypassKey{kind: "group", a: actor.Group.ID.ValueString()}
+	}
+	// team is stored as group. Match the group id the API returns so refresh
+	// does not drop the bypass while the configuration still uses the deprecated block.
+	if actor.Team != nil && !actor.Team.GroupPublicID.IsNull() && !actor.Team.GroupPublicID.IsUnknown() {
+		set++
+		key = bypassKey{kind: "group", a: actor.Team.GroupPublicID.ValueString()}
 	}
 	if actor.App != nil && !actor.App.ID.IsNull() && !actor.App.ID.IsUnknown() {
 		set++
@@ -960,9 +1052,14 @@ func bypassKeyFromAPI(actor originRulesetBypassActor) (bypassKey, error) {
 		set++
 		key = bypassKey{kind: "user", a: actor.User.ID}
 	}
+	if actor.Group != nil {
+		set++
+		key = bypassKey{kind: "group", a: actor.Group.ID}
+	}
 	if actor.Team != nil {
 		set++
-		key = bypassKey{kind: "team", a: actor.Team.OrganizationPublicID, b: actor.Team.GroupPublicID}
+		// A response that still uses the removed team shape names the same group.
+		key = bypassKey{kind: "group", a: actor.Team.GroupPublicID}
 	}
 	if actor.App != nil {
 		set++
@@ -992,6 +1089,7 @@ func bypassStateFromAPI(want originRepoRulesetBypassModel, actor originRulesetBy
 	}
 	if havePrior {
 		mapped.User = want.User
+		mapped.Group = want.Group
 		mapped.Team = want.Team
 		mapped.App = want.App
 		mapped.OriginRole = want.OriginRole
@@ -1010,6 +1108,9 @@ func bypassFromAPI(actor originRulesetBypassActor) (originRepoRulesetBypassModel
 	}
 	if actor.User != nil {
 		mapped.User = &originRepoRulesetUserModel{ID: types.StringValue(actor.User.ID)}
+	}
+	if actor.Group != nil {
+		mapped.Group = &originRepoRulesetGroupModel{ID: types.StringValue(actor.Group.ID)}
 	}
 	if actor.Team != nil {
 		mapped.Team = &originRepoRulesetTeamModel{

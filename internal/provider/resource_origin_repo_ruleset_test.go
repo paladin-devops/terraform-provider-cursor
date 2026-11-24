@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -116,7 +117,7 @@ func TestOriginRulesetModelMatchesSchema(t *testing.T) {
 	if got := decoded.Rules[0].typedBlocks(); len(got) != 1 || got[0] != originRuleTypePullRequest {
 		t.Fatalf("unset typed rule blocks should be null: %v", got)
 	}
-	if decoded.BypassActors[0].Team != nil || decoded.BypassActors[0].App != nil || decoded.BypassActors[0].OriginRole != nil {
+	if decoded.BypassActors[0].Group != nil || decoded.BypassActors[0].Team != nil || decoded.BypassActors[0].App != nil || decoded.BypassActors[0].OriginRole != nil {
 		t.Fatalf("unset bypass principals should be null: %#v", decoded.BypassActors[0])
 	}
 }
@@ -566,8 +567,8 @@ func TestValidateOriginRulesetModel(t *testing.T) {
 		t.Fatalf("error = %v, want repository_write bypass rejected", err)
 	}
 	writeRole.AllowBroadBypass = types.BoolValue(true)
-	if err := validateOriginRulesetModel(context.Background(), writeRole); err != nil {
-		t.Fatalf("repository_write bypass with allow_broad_bypass: %v", err)
+	if err := validateOriginRulesetModel(context.Background(), writeRole); err == nil || !strings.Contains(err.Error(), "origin_role") || !strings.Contains(err.Error(), "no longer accepts") {
+		t.Fatalf("error = %v, want origin_role rejected after allow_broad_bypass", err)
 	}
 
 	wildcard := valid
@@ -763,7 +764,10 @@ func sampleOriginRulesetModel() originRepoRulesetModel {
 		IncludedRefNames: included,
 		ExcludedRefNames: excluded,
 		Rules: []originRepoRulesetRuleModel{{
-			PullRequest: &originPullRequestRuleModel{RequiredApprovingReviewCount: types.Int64Value(1)},
+			PullRequest: &originPullRequestRuleModel{
+				RequiredApprovingReviewCount: types.Int64Value(1),
+				AllowedMergeMethods:          types.ListNull(types.StringType),
+			},
 		}},
 		BypassActors: []originRepoRulesetBypassModel{{
 			BypassMode: types.StringValue(originBypassModeAlways),
@@ -991,10 +995,18 @@ func TestOriginRuleSchemaHasOneBlockPerRuleType(t *testing.T) {
 		}
 	}
 	pullRequest := rule.NestedObject.Blocks[originRuleTypePullRequest].(schema.SingleNestedBlock)
-	for _, name := range []string{"required_approving_review_count", "dismiss_stale_reviews_on_push", "require_code_owner_review", "require_last_push_approval", "required_review_thread_resolution"} {
+	for _, name := range []string{"required_approving_review_count", "dismiss_stale_reviews_on_push", "require_code_owner_review", "require_last_push_approval", "required_review_thread_resolution", "allowed_merge_methods"} {
 		if _, ok := pullRequest.Attributes[name]; !ok {
 			t.Fatalf("pull_request is missing %s", name)
 		}
+	}
+	if _, ok := pullRequest.Blocks["required_reviewer"].(schema.ListNestedBlock); !ok {
+		t.Fatal("pull_request.required_reviewer is not a list nested block")
+	}
+	maxFileSize := rule.NestedObject.Blocks[originRuleTypeMaxFileSize].(schema.SingleNestedBlock)
+	sizeAttr, ok := maxFileSize.Attributes["max_file_size_bytes"].(schema.Int64Attribute)
+	if !ok || !sizeAttr.Optional {
+		t.Fatal("max_file_size.max_file_size_bytes should be an optional int64 attribute")
 	}
 	model := originRepoRulesetRuleModel{}
 	for _, spec := range originRuleTypeSpecs {
@@ -1161,5 +1173,418 @@ func TestOriginRulesetDeleteNotFoundIsSuccess(t *testing.T) {
 	err := testOriginClient(server).deleteOriginRuleset(context.Background(), "acme", "rocket", "rs_01")
 	if !isOriginNotFound(err) {
 		t.Fatalf("error = %v, want not found", err)
+	}
+}
+
+func TestOriginBypassSchemaDeprecatesTeamAndOriginRole(t *testing.T) {
+	r := &originRepoRulesetResource{}
+	schemaResp := &resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, schemaResp)
+	actors := schemaResp.Schema.Blocks["bypass_actor"].(schema.ListNestedBlock)
+	group := actors.NestedObject.Blocks["group"].(schema.SingleNestedBlock)
+	if group.DeprecationMessage != "" {
+		t.Fatalf("group deprecation = %q, want none", group.DeprecationMessage)
+	}
+	team := actors.NestedObject.Blocks["team"].(schema.SingleNestedBlock)
+	role := actors.NestedObject.Blocks["origin_role"].(schema.SingleNestedBlock)
+	if team.DeprecationMessage != originBypassTeamDeprecation || !strings.Contains(team.DeprecationMessage, "group { id") {
+		t.Fatalf("team deprecation = %q", team.DeprecationMessage)
+	}
+	if role.DeprecationMessage != originBypassOriginRoleDeprecation || !strings.Contains(role.DeprecationMessage, "no longer accepts") {
+		t.Fatalf("origin_role deprecation = %q", role.DeprecationMessage)
+	}
+}
+
+func TestBypassKeyFromAPIAcceptsGroup(t *testing.T) {
+	key, err := bypassKeyFromAPI(originRulesetBypassActor{
+		ID:    "rsba_g",
+		Group: &originRulesetGroupBypass{ID: "grp_01"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != (bypassKey{kind: "group", a: "grp_01"}) {
+		t.Fatalf("key = %#v", key)
+	}
+
+	mapped, err := bypassFromAPI(originRulesetBypassActor{
+		ID:         "rsba_g",
+		BypassMode: originBypassModeAlways,
+		Group:      &originRulesetGroupBypass{ID: "grp_01"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapped.Group == nil || mapped.Group.ID.ValueString() != "grp_01" || mapped.Team != nil || mapped.User != nil {
+		t.Fatalf("mapped = %#v", mapped)
+	}
+}
+
+func TestDeprecatedTeamBypassIsSentAsGroup(t *testing.T) {
+	model := sampleOriginRulesetModel()
+	model.BypassActors = []originRepoRulesetBypassModel{{
+		BypassMode: types.StringValue(originBypassModeAlways),
+		Team: &originRepoRulesetTeamModel{
+			OrganizationPublicID: types.StringValue("org_01"),
+			GroupPublicID:        types.StringValue("grp_01k2ja2000e0080000000000g1"),
+		},
+	}}
+	body, err := rulesetWriteFromModel(context.Background(), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(body.BypassActors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"bypassMode":"always","group":{"id":"grp_01k2ja2000e0080000000000g1"}}]`
+	if string(encoded) != want {
+		t.Fatalf("bypass actors = %s, want %s", encoded, want)
+	}
+	if strings.Contains(string(encoded), "team") || strings.Contains(string(encoded), "organizationPublicId") || strings.Contains(string(encoded), "originRole") {
+		t.Fatalf("deprecated principal was sent: %s", encoded)
+	}
+
+	api := sampleOriginRuleset()
+	api.BypassActors = []originRulesetBypassActor{{
+		ID:         "rsba_g",
+		BypassMode: originBypassModeAlways,
+		Group:      &originRulesetGroupBypass{ID: "grp_01k2ja2000e0080000000000g1"},
+	}}
+	state, err := originRulesetToModel(context.Background(), model, api, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := state.BypassActors[0]
+	if actor.ID.ValueString() != "rsba_g" || actor.Team == nil || actor.Team.GroupPublicID.ValueString() != "grp_01k2ja2000e0080000000000g1" || actor.Group != nil {
+		t.Fatalf("deprecated team block should stay in state until config migrates: %#v", actor)
+	}
+
+	imported := originRepoRulesetModel{Owner: model.Owner, Repo: model.Repo}
+	read, err := originRulesetToModel(context.Background(), imported, api, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read.BypassActors[0].Group == nil || read.BypassActors[0].Group.ID.ValueString() != "grp_01k2ja2000e0080000000000g1" || read.BypassActors[0].Team != nil {
+		t.Fatalf("import should surface group, got %#v", read.BypassActors[0])
+	}
+}
+
+func TestGroupBypassActorValidation(t *testing.T) {
+	model := sampleOriginRulesetModel()
+	model.BypassActors = []originRepoRulesetBypassModel{{
+		BypassMode: types.StringValue(originBypassModeAlways),
+		Group:      &originRepoRulesetGroupModel{ID: types.StringValue("grp_01")},
+	}}
+	if err := validateOriginRulesetModel(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+
+	model.BypassActors[0].Group.ID = types.StringValue("org_01")
+	if err := validateOriginRulesetModel(context.Background(), model); err == nil || !strings.Contains(err.Error(), "grp_") {
+		t.Fatalf("error = %v, want group id prefix rejected", err)
+	}
+
+	model.BypassActors[0].Group.ID = types.StringValue("grp_01")
+	model.BypassActors[0].User = &originRepoRulesetUserModel{ID: types.StringValue("user_01")}
+	if err := validateOriginRulesetModel(context.Background(), model); err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("error = %v, want exactly one principal", err)
+	}
+
+	legacyTeam := sampleOriginRulesetModel()
+	legacyTeam.BypassActors = []originRepoRulesetBypassModel{{
+		BypassMode: types.StringValue(originBypassModeAlways),
+		Team: &originRepoRulesetTeamModel{
+			OrganizationPublicID: types.StringValue("org_01"),
+			GroupPublicID:        types.StringValue("admins"),
+		},
+	}}
+	if err := validateOriginRulesetModel(context.Background(), legacyTeam); err == nil || !strings.Contains(err.Error(), "grp_") {
+		t.Fatalf("error = %v, want team.group_public_id prefix rejected", err)
+	}
+}
+
+func TestOriginRulesetCapsMatchAPI(t *testing.T) {
+	if maxOriginRules != 50 {
+		t.Fatalf("maxOriginRules = %d, want 50", maxOriginRules)
+	}
+	if maxOriginBypassActors != 100 {
+		t.Fatalf("maxOriginBypassActors = %d, want 100", maxOriginBypassActors)
+	}
+
+	rules := sampleOriginRulesetModel()
+	rules.Rules = make([]originRepoRulesetRuleModel, maxOriginRules)
+	for i := range rules.Rules {
+		rules.Rules[i] = originRepoRulesetRuleModel{PullRequest: &originPullRequestRuleModel{}}
+	}
+	if err := validateOriginRulesetModel(context.Background(), rules); err != nil {
+		t.Fatalf("%d rules: %v", maxOriginRules, err)
+	}
+	rules.Rules = append(rules.Rules, originRepoRulesetRuleModel{PullRequest: &originPullRequestRuleModel{}})
+	if err := validateOriginRulesetModel(context.Background(), rules); err == nil || !strings.Contains(err.Error(), "at most 50") {
+		t.Fatalf("error = %v, want 51 rules rejected", err)
+	}
+
+	actors := sampleOriginRulesetModel()
+	actors.BypassActors = make([]originRepoRulesetBypassModel, maxOriginBypassActors)
+	for i := range actors.BypassActors {
+		actors.BypassActors[i] = originRepoRulesetBypassModel{
+			BypassMode: types.StringValue(originBypassModeAlways),
+			User:       &originRepoRulesetUserModel{ID: types.StringValue(fmt.Sprintf("user_%d", i))},
+		}
+	}
+	if err := validateOriginRulesetModel(context.Background(), actors); err != nil {
+		t.Fatalf("%d bypass actors: %v", maxOriginBypassActors, err)
+	}
+	actors.BypassActors = append(actors.BypassActors, originRepoRulesetBypassModel{
+		BypassMode: types.StringValue(originBypassModeAlways),
+		User:       &originRepoRulesetUserModel{ID: types.StringValue("user_extra")},
+	})
+	if err := validateOriginRulesetModel(context.Background(), actors); err == nil || !strings.Contains(err.Error(), "at most 100") {
+		t.Fatalf("error = %v, want 101 bypass actors rejected", err)
+	}
+}
+
+func TestMaxFileSizeRule(t *testing.T) {
+	rule := originRepoRulesetRuleModel{MaxFileSize: &originMaxFileSizeRuleModel{MaxFileSizeBytes: types.Int64Value(1048576)}}
+	raw, err := rule.parameters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"maxFileSizeBytes":1048576}` {
+		t.Fatalf("parameters = %s", raw)
+	}
+
+	model, err := ruleModelFromAPI(originRulesetRule{ID: "rsr_size", RuleType: "max_file_size", Parameters: json.RawMessage(`{"maxFileSizeBytes":1048576}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.MaxFileSize == nil || model.MaxFileSize.MaxFileSizeBytes.ValueInt64() != 1048576 {
+		t.Fatalf("model = %#v", model.MaxFileSize)
+	}
+
+	pushRepository := sampleOriginRulesetModel()
+	pushRepository.Kind = types.StringValue(originRulesetKindPushRepository)
+	emptyRefs, err := stringListValue(context.Background(), []string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushRepository.IncludedRefNames = emptyRefs
+	pushRepository.ExcludedRefNames = emptyRefs
+	pushRepository.Rules = []originRepoRulesetRuleModel{{MaxFileSize: &originMaxFileSizeRuleModel{MaxFileSizeBytes: types.Int64Value(1)}}}
+	if err := validateOriginRulesetModel(context.Background(), pushRepository); err != nil {
+		t.Fatalf("1 byte on push_repository: %v", err)
+	}
+	pushRepository.Rules[0].MaxFileSize.MaxFileSizeBytes = types.Int64Value(maxOriginFileSizeBytes)
+	if err := validateOriginRulesetModel(context.Background(), pushRepository); err != nil {
+		t.Fatalf("100 MiB on push_repository: %v", err)
+	}
+	pushRepository.Rules[0].MaxFileSize.MaxFileSizeBytes = types.Int64Value(0)
+	if err := validateOriginRulesetModel(context.Background(), pushRepository); err == nil || !strings.Contains(err.Error(), "between 1 and") {
+		t.Fatalf("error = %v, want zero rejected", err)
+	}
+	pushRepository.Rules[0].MaxFileSize.MaxFileSizeBytes = types.Int64Value(maxOriginFileSizeBytes + 1)
+	if err := validateOriginRulesetModel(context.Background(), pushRepository); err == nil || !strings.Contains(err.Error(), "104857600") {
+		t.Fatalf("error = %v, want size above 100 MiB rejected", err)
+	}
+	pushRepository.Rules[0].MaxFileSize.MaxFileSizeBytes = types.Int64Null()
+	if err := validateOriginRulesetModel(context.Background(), pushRepository); err == nil || !strings.Contains(err.Error(), "max_file_size_bytes is required") {
+		t.Fatalf("error = %v, want missing size rejected", err)
+	}
+
+	for _, kind := range []string{originRulesetKindMergeBranch, originRulesetKindPushBranch, originRulesetKindPushTag} {
+		wrongKind := sampleOriginRulesetModel()
+		wrongKind.Kind = types.StringValue(kind)
+		wrongKind.Rules = []originRepoRulesetRuleModel{{MaxFileSize: &originMaxFileSizeRuleModel{MaxFileSizeBytes: types.Int64Value(1024)}}}
+		if err := validateOriginRulesetModel(context.Background(), wrongKind); err == nil || !strings.Contains(err.Error(), "push_repository") {
+			t.Fatalf("kind %s error = %v, want push_repository required", kind, err)
+		}
+	}
+
+	withPattern := pushRepository
+	withPattern.Rules = []originRepoRulesetRuleModel{{MaxFileSize: &originMaxFileSizeRuleModel{MaxFileSizeBytes: types.Int64Value(1024)}}}
+	withPattern.IncludedRefNames = sampleOriginRulesetModel().IncludedRefNames
+	if err := validateOriginRulesetModel(context.Background(), withPattern); err == nil || !strings.Contains(err.Error(), "included_ref_names must be empty") {
+		t.Fatalf("error = %v, want push_repository ref pattern rejected", err)
+	}
+}
+
+func TestPullRequestReviewerParameters(t *testing.T) {
+	methods, err := stringListValue(context.Background(), []string{"squash", "merge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := originRepoRulesetRuleModel{PullRequest: &originPullRequestRuleModel{
+		RequiredApprovingReviewCount: types.Int64Value(1),
+		AllowedMergeMethods:          methods,
+		RequiredReviewers: []originRequiredReviewerModel{{
+			Group:            &originRequiredReviewerGroupModel{ID: types.StringValue("grp_01k2ja2000e0080000000000g1")},
+			MinimumApprovals: types.Int64Value(2),
+		}},
+	}}
+	raw, err := rule.parameters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"requiredApprovingReviewCount":1,"allowedMergeMethods":["squash","merge"],"requiredReviewers":[{"group":{"id":"grp_01k2ja2000e0080000000000g1"},"minimumApprovals":2}]}`
+	if string(raw) != want {
+		t.Fatalf("parameters = %s, want %s", raw, want)
+	}
+
+	decoded, err := ruleModelFromAPI(originRulesetRule{ID: "rsr_pr", RuleType: "pull_request", Parameters: raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.PullRequest.RequiredReviewers) != 1 || decoded.PullRequest.RequiredReviewers[0].Group.ID.ValueString() != "grp_01k2ja2000e0080000000000g1" || decoded.PullRequest.RequiredReviewers[0].MinimumApprovals.ValueInt64() != 2 {
+		t.Fatalf("reviewers = %#v", decoded.PullRequest.RequiredReviewers)
+	}
+	gotMethods, err := stringValues(decoded.PullRequest.AllowedMergeMethods)
+	if err != nil || len(gotMethods) != 2 || gotMethods[0] != "squash" || gotMethods[1] != "merge" {
+		t.Fatalf("methods = %#v, err = %v", gotMethods, err)
+	}
+
+	legacy, err := ruleModelFromAPI(originRulesetRule{ID: "rsr_old", RuleType: "pull_request", Parameters: json.RawMessage(`{"requiredReviewers":[{"team":{"organizationPublicId":"org_01","groupPublicId":"grp_01"},"minimumApprovals":1}]}`)})
+	if err == nil || !strings.Contains(err.Error(), "removed team shape") {
+		t.Fatalf("decoded %#v, error = %v, want legacy team reviewer rejected", legacy, err)
+	}
+
+	model := sampleOriginRulesetModel()
+	model.Rules = []originRepoRulesetRuleModel{rule}
+	if err := validateOriginRulesetModel(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	model.Rules[0].PullRequest.RequiredReviewers[0].Group.ID = types.StringValue("not-a-group")
+	if err := validateOriginRulesetModel(context.Background(), model); err == nil || !strings.Contains(err.Error(), "grp_") {
+		t.Fatalf("error = %v, want group id rejected", err)
+	}
+	model.Rules[0].PullRequest.RequiredReviewers[0].Group.ID = types.StringValue("grp_01k2ja2000e0080000000000g1")
+	model.Rules[0].PullRequest.RequiredReviewers[0].MinimumApprovals = types.Int64Value(0)
+	if err := validateOriginRulesetModel(context.Background(), model); err == nil || !strings.Contains(err.Error(), "minimum_approvals") {
+		t.Fatalf("error = %v, want minimum approvals rejected", err)
+	}
+	emptyMethods, err := stringListValue(context.Background(), []string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.Rules[0].PullRequest.RequiredReviewers[0].MinimumApprovals = types.Int64Value(1)
+	model.Rules[0].PullRequest.AllowedMergeMethods = emptyMethods
+	if err := validateOriginRulesetModel(context.Background(), model); err == nil || !strings.Contains(err.Error(), "empty list") {
+		t.Fatalf("error = %v, want empty merge methods rejected", err)
+	}
+}
+
+func TestOriginRulesetUpdateDoesNotStripPullRequestReviewers(t *testing.T) {
+	var puts []originRulesetWrite
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/repos/acme/rocket/rulesets/rs_01" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		var body originRulesetWrite
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode update: %v", err)
+			return
+		}
+		puts = append(puts, body)
+		ruleset := sampleOriginRuleset()
+		ruleset.BypassActors = []originRulesetBypassActor{}
+		if len(body.Rules) == 1 {
+			ruleset.Rules[0].Parameters = body.Rules[0].Parameters
+			ruleset.Rules[0].RuleType = body.Rules[0].RuleType
+		}
+		writeJSON(t, w, http.StatusOK, ruleset)
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	res := &originRepoRulesetResource{client: testOriginClient(server)}
+	schemaResp := &resource.SchemaResponse{}
+	res.Schema(ctx, resource.SchemaRequest{}, schemaResp)
+
+	model := pullRequestReviewersModel()
+	model.ID = types.StringValue("rs_01")
+	model.DeletionProtection = types.BoolValue(true)
+	state := tfsdk.State{Schema: schemaResp.Schema}
+	if diags := state.Set(ctx, &model); diags.HasError() {
+		t.Fatal(diags)
+	}
+	plan := tfsdk.Plan{Schema: schemaResp.Schema}
+	if diags := plan.Set(ctx, &model); diags.HasError() {
+		t.Fatal(diags)
+	}
+
+	resp := &resource.UpdateResponse{State: state}
+	res.Update(ctx, resource.UpdateRequest{Plan: plan, State: state}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("update: %v", resp.Diagnostics)
+	}
+	if len(puts) != 1 {
+		t.Fatalf("updates = %d, want 1", len(puts))
+	}
+	assertPullRequestReviewersKept(t, puts[0])
+
+	var afterFirst originRepoRulesetModel
+	if diags := resp.State.Get(ctx, &afterFirst); diags.HasError() {
+		t.Fatal(diags)
+	}
+	plan = tfsdk.Plan{Schema: schemaResp.Schema}
+	if diags := plan.Set(ctx, &afterFirst); diags.HasError() {
+		t.Fatal(diags)
+	}
+	second := &resource.UpdateResponse{State: resp.State}
+	res.Update(ctx, resource.UpdateRequest{Plan: plan, State: resp.State}, second)
+	if second.Diagnostics.HasError() {
+		t.Fatalf("second update: %v", second.Diagnostics)
+	}
+	if len(puts) != 2 {
+		t.Fatalf("updates = %d, want 2", len(puts))
+	}
+	assertPullRequestReviewersKept(t, puts[1])
+	if string(puts[1].Rules[0].Parameters) != string(puts[0].Rules[0].Parameters) {
+		t.Fatalf("second update stripped pull_request parameters:\nfirst  %s\nsecond %s", puts[0].Rules[0].Parameters, puts[1].Rules[0].Parameters)
+	}
+
+	var stored originRepoRulesetModel
+	if diags := second.State.Get(ctx, &stored); diags.HasError() {
+		t.Fatal(diags)
+	}
+	if len(stored.Rules) != 1 || len(stored.Rules[0].PullRequest.RequiredReviewers) != 1 {
+		t.Fatalf("state dropped required reviewers: %#v", stored.Rules)
+	}
+	if stored.Rules[0].PullRequest.RequiredReviewers[0].MinimumApprovals.ValueInt64() != 2 {
+		t.Fatalf("minimum approvals = %#v", stored.Rules[0].PullRequest.RequiredReviewers[0])
+	}
+}
+
+func pullRequestReviewersModel() originRepoRulesetModel {
+	model := sampleOriginRulesetModel()
+	model.BypassActors = nil
+	methods, err := stringListValue(context.Background(), []string{"squash", "merge"})
+	if err != nil {
+		panic(err)
+	}
+	model.Rules = []originRepoRulesetRuleModel{{
+		PullRequest: &originPullRequestRuleModel{
+			RequiredApprovingReviewCount: types.Int64Value(1),
+			AllowedMergeMethods:          methods,
+			RequiredReviewers: []originRequiredReviewerModel{{
+				Group:            &originRequiredReviewerGroupModel{ID: types.StringValue("grp_01k2ja2000e0080000000000g1")},
+				MinimumApprovals: types.Int64Value(2),
+			}},
+		},
+	}}
+	return model
+}
+
+func assertPullRequestReviewersKept(t *testing.T, body originRulesetWrite) {
+	t.Helper()
+	if len(body.Rules) != 1 {
+		t.Fatalf("rules = %#v", body.Rules)
+	}
+	params := string(body.Rules[0].Parameters)
+	want := `{"requiredApprovingReviewCount":1,"allowedMergeMethods":["squash","merge"],"requiredReviewers":[{"group":{"id":"grp_01k2ja2000e0080000000000g1"},"minimumApprovals":2}]}`
+	if params != want {
+		t.Fatalf("update parameters = %s, want %s", params, want)
 	}
 }

@@ -1,11 +1,13 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
@@ -13,8 +15,9 @@ import (
 // Origin rule types. Each one maps to exactly one typed block under rule.
 // Merge rules are evaluated when a pull request merges (kind merge_branch);
 // push rules are evaluated on ref updates (kind push_branch, push_tag,
-// push_repository). The wire format is unchanged: ruleType plus a JSON
-// parameters object whose keys are the camelCase form of the block attributes.
+// push_repository). max_file_size runs only for push_repository. The wire
+// format is ruleType plus a JSON parameters object whose keys are the
+// camelCase form of the block attributes.
 const (
 	originRuleTypePullRequest           = "pull_request"
 	originRuleTypeRequireStatusChecks   = "require_status_checks"
@@ -25,8 +28,15 @@ const (
 	originRuleTypeBlockMerges           = "block_merges"
 	originRuleTypeRequiredLinearHistory = "required_linear_history"
 	originRuleTypeRefNamePattern        = "ref_name_pattern"
+	originRuleTypeMaxFileSize           = "max_file_size"
 
 	maxOriginRequiredApprovingReviews = 50
+	// requiredReviewers holds at most 20 groups. minimumApprovals is 1..50.
+	maxOriginRequiredReviewers       = 20
+	maxOriginReviewerApprovals       = 50
+	originMergeMethodMerge           = "merge"
+	originMergeMethodSquash          = "squash"
+	maxOriginFileSizeBytes     int64 = 104857600
 )
 
 type originRuleCategory int
@@ -39,6 +49,9 @@ const (
 type originRuleTypeSpec struct {
 	ruleType string
 	category originRuleCategory
+	// kinds, when set, restricts the rule to those ruleset kinds. Empty means
+	// every kind in category.
+	kinds []string
 }
 
 // originRuleTypeSpecs is the ordered registry of typed rule blocks. The order
@@ -53,6 +66,7 @@ var originRuleTypeSpecs = []originRuleTypeSpec{
 	{ruleType: originRuleTypeBlockMerges, category: originPushRule},
 	{ruleType: originRuleTypeRequiredLinearHistory, category: originPushRule},
 	{ruleType: originRuleTypeRefNamePattern, category: originPushRule},
+	{ruleType: originRuleTypeMaxFileSize, category: originPushRule, kinds: []string{originRulesetKindPushRepository}},
 }
 
 func originRuleTypeNames() []string {
@@ -63,13 +77,48 @@ func originRuleTypeNames() []string {
 	return names
 }
 
-func originRuleCategoryOf(ruleType string) (originRuleCategory, bool) {
+func originRuleSpec(ruleType string) (originRuleTypeSpec, bool) {
 	for _, spec := range originRuleTypeSpecs {
 		if spec.ruleType == ruleType {
-			return spec.category, true
+			return spec, true
 		}
 	}
-	return 0, false
+	return originRuleTypeSpec{}, false
+}
+
+// originRuleAllowedOnKind reports whether ruleType runs in a ruleset of kind.
+func originRuleAllowedOnKind(ruleType, kind string) bool {
+	spec, ok := originRuleSpec(ruleType)
+	if !ok {
+		return false
+	}
+	if len(spec.kinds) > 0 {
+		for _, allowed := range spec.kinds {
+			if kind == allowed {
+				return true
+			}
+		}
+		return false
+	}
+	kindCategory, known := originKindCategory(kind)
+	return known && kindCategory == spec.category
+}
+
+func originRuleKindError(name, ruleType string) error {
+	spec, ok := originRuleSpec(ruleType)
+	if !ok {
+		return fmt.Errorf("%s has unknown rule type %s", name, ruleType)
+	}
+	if len(spec.kinds) == 1 {
+		return fmt.Errorf("%s.%s is only valid when kind is %s", name, ruleType, spec.kinds[0])
+	}
+	if len(spec.kinds) > 1 {
+		return fmt.Errorf("%s.%s is only valid when kind is %s", name, ruleType, strings.Join(spec.kinds, ", "))
+	}
+	if spec.category == originMergeRule {
+		return fmt.Errorf("%s.%s is a merge rule and requires kind %s", name, ruleType, originRulesetKindMergeBranch)
+	}
+	return fmt.Errorf("%s.%s is a push rule and requires kind %s, %s, or %s", name, ruleType, originRulesetKindPushBranch, originRulesetKindPushTag, originRulesetKindPushRepository)
 }
 
 func originKindCategory(kind string) (originRuleCategory, bool) {
@@ -95,14 +144,30 @@ type originRepoRulesetRuleModel struct {
 	BlockMerges           *originEmptyRuleModel               `tfsdk:"block_merges"`
 	RequiredLinearHistory *originEmptyRuleModel               `tfsdk:"required_linear_history"`
 	RefNamePattern        *originRefNamePatternRuleModel      `tfsdk:"ref_name_pattern"`
+	MaxFileSize           *originMaxFileSizeRuleModel         `tfsdk:"max_file_size"`
 }
 
 type originPullRequestRuleModel struct {
-	RequiredApprovingReviewCount   types.Int64 `tfsdk:"required_approving_review_count"`
-	DismissStaleReviewsOnPush      types.Bool  `tfsdk:"dismiss_stale_reviews_on_push"`
-	RequireCodeOwnerReview         types.Bool  `tfsdk:"require_code_owner_review"`
-	RequireLastPushApproval        types.Bool  `tfsdk:"require_last_push_approval"`
-	RequiredReviewThreadResolution types.Bool  `tfsdk:"required_review_thread_resolution"`
+	RequiredApprovingReviewCount   types.Int64                   `tfsdk:"required_approving_review_count"`
+	DismissStaleReviewsOnPush      types.Bool                    `tfsdk:"dismiss_stale_reviews_on_push"`
+	RequireCodeOwnerReview         types.Bool                    `tfsdk:"require_code_owner_review"`
+	RequireLastPushApproval        types.Bool                    `tfsdk:"require_last_push_approval"`
+	RequiredReviewThreadResolution types.Bool                    `tfsdk:"required_review_thread_resolution"`
+	AllowedMergeMethods            types.List                    `tfsdk:"allowed_merge_methods"`
+	RequiredReviewers              []originRequiredReviewerModel `tfsdk:"required_reviewer"`
+}
+
+type originRequiredReviewerModel struct {
+	Group            *originRequiredReviewerGroupModel `tfsdk:"group"`
+	MinimumApprovals types.Int64                       `tfsdk:"minimum_approvals"`
+}
+
+type originRequiredReviewerGroupModel struct {
+	ID types.String `tfsdk:"id"`
+}
+
+type originMaxFileSizeRuleModel struct {
+	MaxFileSizeBytes types.Int64 `tfsdk:"max_file_size_bytes"`
 }
 
 type originRequireStatusChecksRuleModel struct {
@@ -128,15 +193,30 @@ type originEmptyRuleModel struct{}
 
 // Wire shapes for the parameters object, keyed in camelCase.
 type originPullRequestParameters struct {
-	RequiredApprovingReviewCount   *int64 `json:"requiredApprovingReviewCount,omitempty"`
-	DismissStaleReviewsOnPush      *bool  `json:"dismissStaleReviewsOnPush,omitempty"`
-	RequireCodeOwnerReview         *bool  `json:"requireCodeOwnerReview,omitempty"`
-	RequireLastPushApproval        *bool  `json:"requireLastPushApproval,omitempty"`
-	RequiredReviewThreadResolution *bool  `json:"requiredReviewThreadResolution,omitempty"`
+	RequiredApprovingReviewCount   *int64                             `json:"requiredApprovingReviewCount,omitempty"`
+	DismissStaleReviewsOnPush      *bool                              `json:"dismissStaleReviewsOnPush,omitempty"`
+	RequireCodeOwnerReview         *bool                              `json:"requireCodeOwnerReview,omitempty"`
+	RequireLastPushApproval        *bool                              `json:"requireLastPushApproval,omitempty"`
+	RequiredReviewThreadResolution *bool                              `json:"requiredReviewThreadResolution,omitempty"`
+	AllowedMergeMethods            []string                           `json:"allowedMergeMethods,omitempty"`
+	RequiredReviewers              []originRequiredReviewerParameters `json:"requiredReviewers,omitempty"`
+}
+
+type originRequiredReviewerParameters struct {
+	Group            originRequiredReviewerGroupParameters `json:"group"`
+	MinimumApprovals *int64                                `json:"minimumApprovals,omitempty"`
+}
+
+type originRequiredReviewerGroupParameters struct {
+	ID string `json:"id"`
+}
+
+type originMaxFileSizeParameters struct {
+	MaxFileSizeBytes *int64 `json:"maxFileSizeBytes,omitempty"`
 }
 
 func (p originPullRequestParameters) empty() bool {
-	return p.RequiredApprovingReviewCount == nil && p.DismissStaleReviewsOnPush == nil && p.RequireCodeOwnerReview == nil && p.RequireLastPushApproval == nil && p.RequiredReviewThreadResolution == nil
+	return p.RequiredApprovingReviewCount == nil && p.DismissStaleReviewsOnPush == nil && p.RequireCodeOwnerReview == nil && p.RequireLastPushApproval == nil && p.RequiredReviewThreadResolution == nil && len(p.AllowedMergeMethods) == 0 && len(p.RequiredReviewers) == 0
 }
 
 type originRequireStatusChecksParameters struct {
@@ -159,11 +239,11 @@ type originRefNamePatternParameters struct {
 func originRuleBlocks() map[string]schema.Block {
 	return map[string]schema.Block{
 		originRuleTypePullRequest: schema.SingleNestedBlock{
-			Description: "Merge rule: require a pull request before merging. Every argument is optional; omitted arguments use the Origin default. Rulesets of kind merge_branch only.",
+			Description: "Merge rule: require a pull request before merging. Every argument is optional; omitted arguments use the Origin default. allowed_merge_methods and required_reviewer are sent on update when set, so an update does not clear them. Rulesets of kind merge_branch only.",
 			Attributes: map[string]schema.Attribute{
 				"required_approving_review_count": schema.Int64Attribute{
 					Optional:    true,
-					Description: "Number of approving reviews required before the pull request can merge, from 0 to 50.",
+					Description: "Number of approving reviews required before the pull request can merge, from 0 to 50. An approval counts only while the user can submit reviews on the repository.",
 				},
 				"dismiss_stale_reviews_on_push": schema.BoolAttribute{
 					Optional:    true,
@@ -180,6 +260,35 @@ func originRuleBlocks() map[string]schema.Block {
 				"required_review_thread_resolution": schema.BoolAttribute{
 					Optional:    true,
 					Description: "Require every review thread to be resolved before merging.",
+				},
+				"allowed_merge_methods": schema.ListAttribute{
+					Optional:    true,
+					ElementType: types.StringType,
+					Description: "Merge methods a pull request can land with on a targeted branch: merge, squash, or both. Omit it to allow every method the repository allows. An empty list is rejected. A method the repository disables stays disabled, and when several active rulesets apply, only a method every one of them lists is allowed.",
+				},
+			},
+			Blocks: map[string]schema.Block{
+				"required_reviewer": schema.ListNestedBlock{
+					Description: fmt.Sprintf("Cursor organization group whose members must approve, in addition to required_approving_review_count. At most %d groups, each listed once. A group that later stops resolving blocks every merge this rule covers. An approval counts only while the member can submit reviews on the repository.", maxOriginRequiredReviewers),
+					NestedObject: schema.NestedBlockObject{
+						Attributes: map[string]schema.Attribute{
+							"minimum_approvals": schema.Int64Attribute{
+								Optional:    true,
+								Description: fmt.Sprintf("Approvals required from distinct members of the group, from 1 to %d. Omit it to use the Origin default of 1.", maxOriginReviewerApprovals),
+							},
+						},
+						Blocks: map[string]schema.Block{
+							"group": schema.SingleNestedBlock{
+								Description: "The group that must approve, named by its immutable public ID. Required in each required_reviewer.",
+								Attributes: map[string]schema.Attribute{
+									"id": schema.StringAttribute{
+										Optional:    true,
+										Description: "Group public ID (grp_...). Origin derives the group's organization from it. Required when the group block is set.",
+									},
+								},
+							},
+						},
+					},
 				},
 			},
 		},
@@ -246,6 +355,15 @@ func originRuleBlocks() map[string]schema.Block {
 				},
 			},
 		},
+		originRuleTypeMaxFileSize: schema.SingleNestedBlock{
+			Description: fmt.Sprintf("Push rule: reject a push that introduces a file larger than max_file_size_bytes. The whole push is rejected, including other refs it changes. Files the repository already stores are not judged again. Only rulesets of kind %s accept this rule.", originRulesetKindPushRepository),
+			Attributes: map[string]schema.Attribute{
+				"max_file_size_bytes": schema.Int64Attribute{
+					Optional:    true,
+					Description: fmt.Sprintf("Largest file a push can introduce, in bytes, from 1 to %d (100 MiB). Required when the max_file_size block is set.", maxOriginFileSizeBytes),
+				},
+			},
+		},
 	}
 }
 
@@ -279,6 +397,9 @@ func (m originRepoRulesetRuleModel) typedBlocks() []string {
 	if m.RefNamePattern != nil {
 		set = append(set, originRuleTypeRefNamePattern)
 	}
+	if m.MaxFileSize != nil {
+		set = append(set, originRuleTypeMaxFileSize)
+	}
 	return set
 }
 
@@ -298,21 +419,20 @@ func (m originRepoRulesetRuleModel) validate(name string, kind types.String) err
 	if err != nil {
 		return fmt.Errorf("%s %w", name, err)
 	}
-	if !kind.IsNull() && !kind.IsUnknown() {
-		kindCategory, kindKnown := originKindCategory(kind.ValueString())
-		ruleCategory, _ := originRuleCategoryOf(ruleType)
-		if kindKnown && kindCategory != ruleCategory {
-			if ruleCategory == originMergeRule {
-				return fmt.Errorf("%s.%s is a merge rule and requires kind %s", name, ruleType, originRulesetKindMergeBranch)
-			}
-			return fmt.Errorf("%s.%s is a push rule and requires kind %s, %s, or %s", name, ruleType, originRulesetKindPushBranch, originRulesetKindPushTag, originRulesetKindPushRepository)
-		}
+	if !kind.IsNull() && !kind.IsUnknown() && !originRuleAllowedOnKind(ruleType, kind.ValueString()) {
+		return originRuleKindError(name, ruleType)
 	}
 	switch ruleType {
 	case originRuleTypePullRequest:
 		count := m.PullRequest.RequiredApprovingReviewCount
 		if !count.IsNull() && !count.IsUnknown() && (count.ValueInt64() < 0 || count.ValueInt64() > maxOriginRequiredApprovingReviews) {
 			return fmt.Errorf("%s.pull_request.required_approving_review_count must be between 0 and %d", name, maxOriginRequiredApprovingReviews)
+		}
+		if err := validateAllowedMergeMethods(name, m.PullRequest.AllowedMergeMethods); err != nil {
+			return err
+		}
+		if err := validateRequiredReviewers(name, m.PullRequest.RequiredReviewers); err != nil {
+			return err
 		}
 	case originRuleTypeRequireStatusChecks:
 		for i, check := range m.RequireStatusChecks.RequiredChecks {
@@ -341,6 +461,69 @@ func (m originRepoRulesetRuleModel) validate(name string, kind types.String) err
 		if err := requireNonEmptyUnpadded(m.RefNamePattern.Pattern, name+".ref_name_pattern.pattern"); err != nil {
 			return err
 		}
+	case originRuleTypeMaxFileSize:
+		size := m.MaxFileSize.MaxFileSizeBytes
+		if size.IsNull() {
+			return fmt.Errorf("%s.max_file_size.max_file_size_bytes is required", name)
+		}
+		if !size.IsUnknown() && (size.ValueInt64() < 1 || size.ValueInt64() > maxOriginFileSizeBytes) {
+			return fmt.Errorf("%s.max_file_size.max_file_size_bytes must be between 1 and %d", name, maxOriginFileSizeBytes)
+		}
+	}
+	return nil
+}
+
+func validateAllowedMergeMethods(name string, methods types.List) error {
+	if methods.IsNull() || methods.IsUnknown() {
+		return nil
+	}
+	values, err := stringValues(methods)
+	if err != nil {
+		return fmt.Errorf("%s.pull_request.allowed_merge_methods: %w", name, err)
+	}
+	if len(values) == 0 {
+		return fmt.Errorf("%s.pull_request.allowed_merge_methods must list merge, squash, or both; an empty list is rejected", name)
+	}
+	seen := make(map[string]struct{}, len(values))
+	for i, method := range values {
+		if strings.TrimSpace(method) != method {
+			return fmt.Errorf("%s.pull_request.allowed_merge_methods[%d] must not have leading or trailing spaces", name, i)
+		}
+		if method != originMergeMethodMerge && method != originMergeMethodSquash {
+			return fmt.Errorf("%s.pull_request.allowed_merge_methods[%d] must be %s or %s", name, i, originMergeMethodMerge, originMergeMethodSquash)
+		}
+		if _, ok := seen[method]; ok {
+			return fmt.Errorf("%s.pull_request.allowed_merge_methods lists %s more than once", name, method)
+		}
+		seen[method] = struct{}{}
+	}
+	return nil
+}
+
+func validateRequiredReviewers(name string, reviewers []originRequiredReviewerModel) error {
+	if len(reviewers) > maxOriginRequiredReviewers {
+		return fmt.Errorf("%s.pull_request.required_reviewer has %d entries; the Origin API allows at most %d", name, len(reviewers), maxOriginRequiredReviewers)
+	}
+	seen := make(map[string]struct{}, len(reviewers))
+	for i, reviewer := range reviewers {
+		prefix := fmt.Sprintf("%s.pull_request.required_reviewer[%d]", name, i)
+		if reviewer.Group == nil {
+			return fmt.Errorf("%s.group is required", prefix)
+		}
+		if err := requireGroupPublicID(reviewer.Group.ID, prefix+".group.id"); err != nil {
+			return err
+		}
+		if !reviewer.Group.ID.IsNull() && !reviewer.Group.ID.IsUnknown() {
+			id := reviewer.Group.ID.ValueString()
+			if _, ok := seen[id]; ok {
+				return fmt.Errorf("%s.group.id %s is listed more than once", prefix, id)
+			}
+			seen[id] = struct{}{}
+		}
+		approvals := reviewer.MinimumApprovals
+		if !approvals.IsNull() && !approvals.IsUnknown() && (approvals.ValueInt64() < 1 || approvals.ValueInt64() > maxOriginReviewerApprovals) {
+			return fmt.Errorf("%s.minimum_approvals must be between 1 and %d", prefix, maxOriginReviewerApprovals)
+		}
 	}
 	return nil
 }
@@ -355,12 +538,28 @@ func (m originRepoRulesetRuleModel) parameters() (json.RawMessage, error) {
 	var wire any
 	switch ruleType {
 	case originRuleTypePullRequest:
+		methods, err := stringValues(m.PullRequest.AllowedMergeMethods)
+		if err != nil {
+			return nil, fmt.Errorf("pull_request.allowed_merge_methods is incomplete")
+		}
+		reviewers := make([]originRequiredReviewerParameters, 0, len(m.PullRequest.RequiredReviewers))
+		for i, reviewer := range m.PullRequest.RequiredReviewers {
+			if reviewer.Group == nil || reviewer.Group.ID.IsUnknown() || reviewer.MinimumApprovals.IsUnknown() {
+				return nil, fmt.Errorf("pull_request.required_reviewer[%d] is incomplete", i)
+			}
+			reviewers = append(reviewers, originRequiredReviewerParameters{
+				Group:            originRequiredReviewerGroupParameters{ID: reviewer.Group.ID.ValueString()},
+				MinimumApprovals: int64Pointer(reviewer.MinimumApprovals),
+			})
+		}
 		params := originPullRequestParameters{
 			RequiredApprovingReviewCount:   int64Pointer(m.PullRequest.RequiredApprovingReviewCount),
 			DismissStaleReviewsOnPush:      boolPointer(m.PullRequest.DismissStaleReviewsOnPush),
 			RequireCodeOwnerReview:         boolPointer(m.PullRequest.RequireCodeOwnerReview),
 			RequireLastPushApproval:        boolPointer(m.PullRequest.RequireLastPushApproval),
 			RequiredReviewThreadResolution: boolPointer(m.PullRequest.RequiredReviewThreadResolution),
+			AllowedMergeMethods:            methods,
+			RequiredReviewers:              reviewers,
 		}
 		if params.empty() {
 			return nil, nil
@@ -391,6 +590,14 @@ func (m originRepoRulesetRuleModel) parameters() (json.RawMessage, error) {
 			Pattern: m.RefNamePattern.Pattern.ValueString(),
 			Negate:  boolPointer(m.RefNamePattern.Negate),
 		}
+	case originRuleTypeMaxFileSize:
+		if m.MaxFileSize == nil || m.MaxFileSize.MaxFileSizeBytes.IsUnknown() {
+			return nil, fmt.Errorf("max_file_size is incomplete")
+		}
+		if m.MaxFileSize.MaxFileSizeBytes.IsNull() {
+			return nil, fmt.Errorf("max_file_size.max_file_size_bytes is required")
+		}
+		wire = originMaxFileSizeParameters{MaxFileSizeBytes: int64Pointer(m.MaxFileSize.MaxFileSizeBytes)}
 	default:
 		return nil, nil
 	}
@@ -443,6 +650,9 @@ func ruleModelFromAPI(rule originRulesetRule) (originRepoRulesetRuleModel, error
 	}
 	switch rule.RuleType {
 	case originRuleTypePullRequest:
+		if err := rejectLegacyPullRequestReviewerTeam(raw); err != nil {
+			return originRepoRulesetRuleModel{}, fmt.Errorf("rule %q parameters: %w", rule.ID, err)
+		}
 		var params originPullRequestParameters
 		if err := json.Unmarshal(raw, &params); err != nil {
 			return originRepoRulesetRuleModel{}, fmt.Errorf("rule %q parameters: %w", rule.ID, err)
@@ -453,6 +663,8 @@ func ruleModelFromAPI(rule originRulesetRule) (originRepoRulesetRuleModel, error
 			RequireCodeOwnerReview:         boolFromPointer(params.RequireCodeOwnerReview),
 			RequireLastPushApproval:        boolFromPointer(params.RequireLastPushApproval),
 			RequiredReviewThreadResolution: boolFromPointer(params.RequiredReviewThreadResolution),
+			AllowedMergeMethods:            stringListOrNull(params.AllowedMergeMethods),
+			RequiredReviewers:              requiredReviewersFromAPI(params.RequiredReviewers),
 		}
 	case originRuleTypeRequireStatusChecks:
 		var params originRequireStatusChecksParameters
@@ -493,6 +705,12 @@ func ruleModelFromAPI(rule originRulesetRule) (originRepoRulesetRuleModel, error
 		model.BlockMerges = &originEmptyRuleModel{}
 	case originRuleTypeRequiredLinearHistory:
 		model.RequiredLinearHistory = &originEmptyRuleModel{}
+	case originRuleTypeMaxFileSize:
+		var params originMaxFileSizeParameters
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return originRepoRulesetRuleModel{}, fmt.Errorf("rule %q parameters: %w", rule.ID, err)
+		}
+		model.MaxFileSize = &originMaxFileSizeRuleModel{MaxFileSizeBytes: int64FromPointer(params.MaxFileSizeBytes)}
 	default:
 		return originRepoRulesetRuleModel{}, fmt.Errorf("Origin API returned rule %q with type %q, which this provider does not support; supported types are %s", rule.ID, rule.RuleType, strings.Join(originRuleTypeNames(), ", "))
 	}
@@ -521,7 +739,12 @@ func ruleStateFromAPI(want originRepoRulesetRuleModel, rule originRulesetRule, a
 		block.RequireCodeOwnerReview = mergeBool(want.PullRequest.RequireCodeOwnerReview, block.RequireCodeOwnerReview)
 		block.RequireLastPushApproval = mergeBool(want.PullRequest.RequireLastPushApproval, block.RequireLastPushApproval)
 		block.RequiredReviewThreadResolution = mergeBool(want.PullRequest.RequiredReviewThreadResolution, block.RequiredReviewThreadResolution)
+		block.AllowedMergeMethods = mergeStringList(want.PullRequest.AllowedMergeMethods, block.AllowedMergeMethods)
+		block.RequiredReviewers = mergeRequiredReviewers(want.PullRequest.RequiredReviewers, block.RequiredReviewers)
 		merged.PullRequest = &block
+	}
+	if want.MaxFileSize != nil && fromAPI.MaxFileSize != nil {
+		merged.MaxFileSize = fromAPI.MaxFileSize
 	}
 	if want.RefNamePattern != nil && fromAPI.RefNamePattern != nil {
 		block := *fromAPI.RefNamePattern
@@ -578,6 +801,147 @@ func requiredCheckIdentityEqual(want, got originRequiredCheckModel) bool {
 		return false
 	}
 	return true
+}
+
+// mergeRequiredReviewers refreshes required_reviewer blocks. Each prior reviewer
+// is paired with the Origin reviewer that names the same group; minimum_approvals
+// stays null when the configuration left it unset. Origin reviewers with no prior
+// counterpart are appended, and prior reviewers Origin no longer reports are dropped.
+// A configuration that does not set required_reviewer keeps it unset.
+func mergeRequiredReviewers(prior, api []originRequiredReviewerModel) []originRequiredReviewerModel {
+	if prior == nil {
+		return nil
+	}
+	if api == nil {
+		return prior
+	}
+	used := make([]bool, len(api))
+	out := make([]originRequiredReviewerModel, 0, len(api))
+	for _, want := range prior {
+		match := -1
+		for i, got := range api {
+			if used[i] || !requiredReviewerIdentityEqual(want, got) {
+				continue
+			}
+			match = i
+			break
+		}
+		if match < 0 {
+			continue
+		}
+		used[match] = true
+		got := api[match]
+		got.MinimumApprovals = mergeInt64(want.MinimumApprovals, got.MinimumApprovals)
+		out = append(out, got)
+	}
+	for i, got := range api {
+		if !used[i] {
+			out = append(out, got)
+		}
+	}
+	return out
+}
+
+func requiredReviewerIdentityEqual(want, got originRequiredReviewerModel) bool {
+	if want.Group == nil || got.Group == nil {
+		return false
+	}
+	return want.Group.ID.Equal(got.Group.ID)
+}
+
+func mergeStringList(prior, api types.List) types.List {
+	if prior.IsNull() || prior.IsUnknown() {
+		return types.ListNull(types.StringType)
+	}
+	if api.IsNull() || api.IsUnknown() {
+		return prior
+	}
+	return api
+}
+
+func requiredReviewersFromAPI(reviewers []originRequiredReviewerParameters) []originRequiredReviewerModel {
+	if reviewers == nil {
+		return nil
+	}
+	out := make([]originRequiredReviewerModel, 0, len(reviewers))
+	for _, reviewer := range reviewers {
+		out = append(out, originRequiredReviewerModel{
+			Group:            &originRequiredReviewerGroupModel{ID: types.StringValue(reviewer.Group.ID)},
+			MinimumApprovals: int64FromPointer(reviewer.MinimumApprovals),
+		})
+	}
+	return out
+}
+
+// rejectLegacyPullRequestReviewerTeam fails a read that still carries the
+// removed requiredReviewers[].team shape. Decoding that shape into the group
+// field would drop the reviewer on the next update and the rule would fail open.
+func rejectLegacyPullRequestReviewerTeam(raw json.RawMessage) error {
+	var probe struct {
+		RequiredReviewers []struct {
+			Group json.RawMessage `json:"group"`
+			Team  json.RawMessage `json:"team"`
+		} `json:"requiredReviewers"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return err
+	}
+	for i, reviewer := range probe.RequiredReviewers {
+		if jsonPresent(reviewer.Team) && !jsonPresent(reviewer.Group) {
+			return fmt.Errorf("requiredReviewers[%d] uses the removed team shape; the Origin API names the group with group.id (%s...)", i, originGroupIDPrefix)
+		}
+	}
+	return nil
+}
+
+func jsonPresent(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null"
+}
+
+// ensureStringList gives an unset list the element type Terraform requires
+// when writing state. A composite literal leaves types.List as a null value
+// with no element type, and state.Set rejects that.
+func ensureStringList(list types.List) types.List {
+	if list.ElementType(context.Background()) != nil {
+		return list
+	}
+	if list.IsUnknown() {
+		return types.ListUnknown(types.StringType)
+	}
+	return types.ListNull(types.StringType)
+}
+
+func stringListOrNull(values []string) types.List {
+	if values == nil {
+		return types.ListNull(types.StringType)
+	}
+	elems := make([]attr.Value, len(values))
+	for i, value := range values {
+		elems[i] = types.StringValue(value)
+	}
+	return types.ListValueMust(types.StringType, elems)
+}
+
+// stringValues returns the list as strings. A null list returns nil, nil.
+// An unknown list or element returns an error.
+func stringValues(list types.List) ([]string, error) {
+	if list.IsNull() {
+		return nil, nil
+	}
+	if list.IsUnknown() {
+		return nil, fmt.Errorf("value is unknown")
+	}
+	elements := list.Elements()
+	values := make([]string, len(elements))
+	for i, element := range elements {
+		value, ok := element.(types.String)
+		if !ok || value.IsNull() || value.IsUnknown() {
+			return nil, fmt.Errorf("element %d is unknown", i)
+		}
+		values[i] = value.ValueString()
+	}
+	return values, nil
 }
 
 func mergeString(prior, api types.String) types.String {

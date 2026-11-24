@@ -27,8 +27,26 @@ const (
 	originRoleRepositoryWrite = "repository_write"
 
 	maxOriginIncludedRefs = 64
-	maxOriginRules        = 20
-	maxOriginBypassActors = 15
+	// Create Ruleset and Update Ruleset accept 50 rules and 100 bypass actors.
+	maxOriginRules        = 50
+	maxOriginBypassActors = 100
+
+	// originBypassPrincipalChoices is the set of bypass_actor blocks a
+	// configuration may set. user, group, and app are the principals the
+	// Origin API stores. team and origin_role remain in the schema so
+	// existing configurations still parse; see the deprecation messages.
+	originBypassPrincipalChoices = "user, group, app, team, or origin_role"
+
+	// originBypassTeamDeprecation documents the October 17, 2026 replacement
+	// of bypassActors[].team with group. The provider still accepts team and
+	// sends group_public_id as group.id so an existing bypass keeps working.
+	originBypassTeamDeprecation = "The Origin API no longer accepts a team bypass actor. Replace team { group_public_id = \"grp_...\" } with group { id = \"grp_...\" } and remove organization_public_id. Origin derives the organization from the group id. Until you migrate, this provider sends group_public_id as group.id and does not send organization_public_id."
+
+	// originBypassOriginRoleDeprecation documents the October 16, 2026 removal
+	// of bypassActors[].originRole. The API rejects the write, and a role
+	// actor never granted a bypass. The block stays in the schema so existing
+	// configurations get this migration error instead of an unknown-block error.
+	originBypassOriginRoleDeprecation = "The Origin API no longer accepts an origin_role bypass actor and rejects the ruleset write. A role actor never granted a bypass, because Origin does not resolve who holds a role. Remove this block. To bypass the ruleset, add user, group, or app actors for the principals who should bypass it."
 )
 
 type originRuleset struct {
@@ -66,23 +84,30 @@ type originRulesetRuleInput struct {
 }
 
 type originRulesetBypassActor struct {
-	ID         string                         `json:"id"`
-	BypassMode string                         `json:"bypassMode"`
-	User       *originRulesetUserBypass       `json:"user,omitempty"`
+	ID         string                    `json:"id"`
+	BypassMode string                    `json:"bypassMode"`
+	User       *originRulesetUserBypass  `json:"user,omitempty"`
+	Group      *originRulesetGroupBypass `json:"group,omitempty"`
+	App        *originRulesetAppBypass   `json:"app,omitempty"`
+	// Team and OriginRole are not accepted on write. They stay on the read
+	// struct so a response that still carries one can be decoded instead of
+	// failing the refresh.
 	Team       *originRulesetTeamBypass       `json:"team,omitempty"`
-	App        *originRulesetAppBypass        `json:"app,omitempty"`
 	OriginRole *originRulesetOriginRoleBypass `json:"originRole,omitempty"`
 }
 
 type originRulesetBypassActorInput struct {
-	BypassMode string                         `json:"bypassMode"`
-	User       *originRulesetUserBypass       `json:"user,omitempty"`
-	Team       *originRulesetTeamBypass       `json:"team,omitempty"`
-	App        *originRulesetAppBypass        `json:"app,omitempty"`
-	OriginRole *originRulesetOriginRoleBypass `json:"originRole,omitempty"`
+	BypassMode string                    `json:"bypassMode"`
+	User       *originRulesetUserBypass  `json:"user,omitempty"`
+	Group      *originRulesetGroupBypass `json:"group,omitempty"`
+	App        *originRulesetAppBypass   `json:"app,omitempty"`
 }
 
 type originRulesetUserBypass struct {
+	ID string `json:"id"`
+}
+
+type originRulesetGroupBypass struct {
 	ID string `json:"id"`
 }
 
